@@ -62,6 +62,19 @@
 #define UART_BAUD_RATE 19200// 19200 baud
 #define UART_MAXSTRLEN 70
 
+// https://www.mikrocontroller.net/articles/Entprellung
+#define KEY_DDR         DDRD
+#define KEY_PORT        PORTD
+#define KEY_PIN         PIND
+#define KEY0            2
+#define KEY1            3
+#define KEY2            2
+#define ALL_KEYS        (1<<KEY0 | 1<<KEY1 | 1<<KEY2)
+ 
+#define REPEAT_MASK     (1<<KEY1 | 1<<KEY2)       // repeat: key1, key2
+#define REPEAT_START    50                        // after 500ms
+#define REPEAT_NEXT     20                        // every 200ms
+
 
 /**@{*/
 /* Global variable declaration */
@@ -89,12 +102,8 @@ unsigned char ret;
 
 char buffer[12];
 char buffer_new[12];
-volatile uint16_t d = 0;
 
-//int32_t e = 0;
-//int32_t flow = 0;
-//int64_t l_flow = 0;
-//int64_t total_flow = 0;
+
 char l_buffer[22];
 char l_buffer_new[22];
 
@@ -113,10 +122,20 @@ char adc_run; // indicates that the ADC is in operation
 char adc_eval[12]; // string including commas
 
 // Flow-meter
-int32_t total_flow;
-char int0_update;
 char flow_string[12];
 char flow_eval[12];
+int32_t total_flow;
+
+// Key
+volatile uint8_t key_state;                                // debounced and inverted key state:
+                                                  // bit = 1: key pressed
+volatile uint8_t key_press;                                // key press detect
+volatile uint8_t key_rpt;                                  // key long press and repeat
+int32_t press_short;
+int32_t press_long;
+char str_press_short[12];
+char str_press_long[12];
+
 
 // Flags
 char flag_sec = 0;
@@ -135,6 +154,28 @@ char update_uart= 0;
  
 
 /* Prototypes */
+ISR( TIMER0_OVF_vect )                            // every 10ms
+{
+  static uint8_t ct0 = 0xFF, ct1 = 0xFF, rpt;
+  uint8_t i;
+ 
+  TCNT0 = (uint8_t)(int16_t)-(F_CPU / 1024 * 10e-3 + 0.5);  // preload for 10ms
+ 
+  i = key_state ^ ~KEY_PIN;                       // key changed ?
+  ct0 = ~( ct0 & i );                             // reset or count ct0
+  ct1 = ct0 ^ (ct1 & i);                          // reset or count ct1
+  i &= ct0 & ct1;                                 // count until roll over ?
+  key_state ^= i;                                 // then toggle debounced state
+  key_press |= key_state & i;                     // 0->1: key press detect
+ 
+  if( (key_state & REPEAT_MASK) == 0 )            // check repeat function
+     rpt = REPEAT_START;                          // start delay
+  if( --rpt == 0 ){
+    rpt = REPEAT_NEXT;                            // repeat delay
+    key_rpt |= key_state & REPEAT_MASK;
+  }
+}
+
 ISR(TIMER1_OVF_vect)
 {	
 	TCNT1 = 59286 ; // 1sec = 3036; 
@@ -142,15 +183,67 @@ ISR(TIMER1_OVF_vect)
 	// 100 ms counter
 }
 
-ISR(INT0_vect)
-{
-	d++;
-	int0_update = 1;
-}
 ISR(ADC_vect) // Interrupt subroutine for ADC conversion complete
 {
 	adc_update = 1;
 } 
+
+///////////////////////////////////////////////////////////////////
+//
+// check if a key has been pressed. Each pressed key is reported
+// only once
+//
+uint8_t get_key_press( uint8_t key_mask )
+{
+  cli();                                          // read and clear atomic !
+  key_mask &= key_press;                          // read key(s)
+  key_press ^= key_mask;                          // clear key(s)
+  sei();
+  return key_mask;
+}
+ 
+///////////////////////////////////////////////////////////////////
+//
+// check if a key has been pressed long enough such that the
+// key repeat functionality kicks in. After a small setup delay
+// the key is reported being pressed in subsequent calls
+// to this function. This simulates the user repeatedly
+// pressing and releasing the key.
+//
+uint8_t get_key_rpt( uint8_t key_mask )
+{
+  cli();                                          // read and clear atomic !
+  key_mask &= key_rpt;                            // read key(s)
+  key_rpt ^= key_mask;                            // clear key(s)
+  sei();
+  return key_mask;
+}
+
+///////////////////////////////////////////////////////////////////
+//
+// check if a key is pressed right now
+//
+uint8_t get_key_state( uint8_t key_mask )
+
+{
+  key_mask &= key_state;
+  return key_mask;
+}
+
+///////////////////////////////////////////////////////////////////
+//
+uint8_t get_key_short( uint8_t key_mask )
+{
+  cli();                                          // read key state and key press atomic !
+  return get_key_press( ~key_state & key_mask );
+}
+ 
+///////////////////////////////////////////////////////////////////
+//
+uint8_t get_key_long( uint8_t key_mask )
+{
+  return get_key_press( get_key_rpt( key_mask ));
+}
 
 int main(void)
 {
@@ -161,17 +254,20 @@ int main(void)
 	sei(); // Interrupt based UART-Liberary
 	uart_puts("\nUART ready\n");
 	
-	/* External Interrupt 0 */
+	/* Configure debouncing routines with Timer/Counter0 */
+	press_short = 0;
+	press_long = 0;
+	KEY_DDR &= ~ALL_KEYS;                // configure key port for input
+	KEY_PORT |= ALL_KEYS;                // and turn on pull up resistors
+	TCCR0B = (1<<CS02)|(1<<CS00);         // divide by 1024
+	TCNT0 = (uint8_t)(int16_t)-(F_CPU / 1024 * 10e-3 + 0.5);  // preload for 10ms
+	TIMSK0 |= 1<<TOIE0;                   // enable timer interrupt
 	
-	//EICRA falling edge generate interrupt request ISC01=1, ISC00=0
-	
-	//DDRD  &= ~(1 << DDD3); // set as input
-	
-	PORTD |= (1 << PD3); // internal pullup activated
-	EIMSK |= (1<<INT0);
-	EICRA |= (1<<ISC01);
-	
-
+	/* Flow-meter */
+	total_flow = 0;
+	my_itoa(press_short,flow_string);
+	my_round(flow_string,3);
+	my_print_str(flow_string, 7, 8, 3, 1, flow_eval);
 	
 	/* Timer/Counter 1 */	
 	TIMSK1 |= _BV(TOIE1); 		// aktivate overflowinterrupts of timer1 
@@ -189,7 +285,7 @@ int main(void)
 	_delay_ms(500);
 	//PORTD &= ~(1 << PD7); // Light off SET output LOW or deactivate internal Pullup
 	lcd_clear();
-	lcd_string_p("Time:",0,1); // row/column
+	//lcd_string_p("Time:",0,1); // row/column
 
 	// ADC
 	adc_channel = adc_channel_max; // first startup of ADC
@@ -197,11 +293,10 @@ int main(void)
 	adc_res_avg = adc_res_avg_max; // Never reached -> Intialisation
 	adc_restart = 0;
 	adc_run = 0;
-	lcd_string_p("bar",13,1); // row/column
+	lcd_string_p("bar",4,2); // row/column
+	lcd_string_p("m3",14,1);
+	lcd_string_p("lpm",13,2);
 
-	// Flow-meter
-	total_flow = 0;
-	int0_update = 1;
 
 	// Set Initial values for first output
 	mystring(msec,str_msec);
@@ -222,20 +317,26 @@ int main(void)
 	str_time[6]='0';
 	str_time[7]='0';
 	str_time[8]='\0';
+	uart_puts("\nTime     bar  m3\n");
 	uart_puts(str_time);
 	
 	while (1)
 	{
 	/* 0 - Flow Counter*/	
-		if (int0_update==1) {
-			total_flow = total_flow+d;
-			d = 0;
-			int0_update=0;
-			my_itoa(total_flow,flow_eval);
-			//my_round(adc_string,7);
-			//my_print_str(adc_string, 0, 11, 0, 1, flow_eval);
+		if( get_key_short( 1<<KEY0 )) {
+			press_short = press_short +1;
+			total_flow = total_flow + 1;
 			
+			my_itoa(press_short,flow_string);
+			//my_round(flow_string,3);
+			my_print_str(flow_string, 7, 8, 3, 1, flow_eval);
 		}
+		/*if( get_key_long( 1<<KEY1 )) {
+			press_long = press_long + 1;
+			my_itoa(press_long, str_press_long);
+			uart_puts(str_press_long);
+		}*/
+		
 	/* 1 - Time routine */
 		if(!(tc==0)) // one  100msec is gone
 		{
@@ -365,9 +466,8 @@ int main(void)
 		}
 		if(update_lcd==1) {	
 			//LCD-outputs
-			lcd_string_p(adc_eval,8,1);
-			//my_print_LCD(adc_string, 3, 4, 2);
-			lcd_string_p(flow_eval,0,2);
+			lcd_string_p(adc_eval,0,2);
+			lcd_string_p(flow_eval,8,1);
 			update_lcd=0;
 		}
 	}
